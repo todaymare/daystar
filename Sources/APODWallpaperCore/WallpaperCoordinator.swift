@@ -6,6 +6,7 @@ public enum WallpaperCoordinatorError: Error, Equatable, LocalizedError, Sendabl
     case noUsableFavorite
     case unsupportedMediaType
     case missingImageURL
+    case updateInProgress
 
     public var errorDescription: String? {
         switch self {
@@ -19,6 +20,8 @@ public enum WallpaperCoordinatorError: Error, Equatable, LocalizedError, Sendabl
             return "This APOD media type cannot be used as a wallpaper."
         case .missingImageURL:
             return "This APOD does not provide an image URL."
+        case .updateInProgress:
+            return "Wait for the current wallpaper update to finish before clearing the cache."
         }
     }
 }
@@ -36,6 +39,9 @@ public final class WallpaperCoordinator {
     public private(set) var lastSuccessfulCheckAt: Date?
     public private(set) var emptyStateMessage: String?
     public private(set) var isUpdating = false
+    public var onChange: (() -> Void)?
+    public private(set) var operationMessage = "Ready"
+    public private(set) var downloadFraction: Double?
 
     public var wallpaperSource: WallpaperSource
     public var updateInterval: UpdateInterval
@@ -44,11 +50,13 @@ public final class WallpaperCoordinator {
     public var wallpaperPresentation: WallpaperPresentation
     public var automaticUpdates: Bool
 
-    private let client: any APODFetching
+    private var client: any APODFetching
     private let store: APODStore
     private let wallpaper: any WallpaperApplying
     private let imageDownloader: any ImageDownloading
     private var navigationCursorID: Int64?
+    private var operationTask: Task<Void, Never>?
+    private var activeDownloadID: UUID?
 
     public init(
         client: any APODFetching,
@@ -101,14 +109,40 @@ public final class WallpaperCoordinator {
         store.record(for: date)?.isFavorite ?? false
     }
 
+    public var canGoPrevious: Bool {
+        guard let navigationCursorID else { return false }
+        return store.navigationEntry(before: navigationCursorID) != nil
+    }
+
+    public func setClient(_ client: any APODFetching) {
+        self.client = client
+    }
+
+    public func cancelUpdate() {
+        guard isUpdating else { return }
+        operationTask?.cancel()
+        operationMessage = "Cancelling…"
+        onChange?()
+    }
+
     public func reapplyCurrent() async {
-        guard let latestAPOD else {
-            return
-        }
-        do {
-            _ = try await display(latestAPOD, recordHistory: false)
-        } catch {
-            lastError = error
+        guard let latestAPOD else { return }
+        await runOperation(message: "Preparing current wallpaper…") {
+            if let record = self.store.record(for: latestAPOD.date) {
+                if record.apod.mediaType != .image, record.cachedImageSourceURL == nil,
+                   let currentImageURL = self.currentImageURL {
+                    self.setOperationMessage("Applying current wallpaper…")
+                    try Task.checkCancellation()
+                    try self.wallpaper.apply(
+                        imageURL: currentImageURL,
+                        presentation: self.wallpaperPresentation
+                    )
+                } else {
+                    _ = try await self.displayHistorical(record, recordHistory: false)
+                }
+            } else {
+                _ = try await self.display(latestAPOD, recordHistory: false)
+            }
         }
     }
 
@@ -122,89 +156,73 @@ public final class WallpaperCoordinator {
     }
 
     public func restoreCachedWallpaper() {
-        guard let navigationEntry = store.latestNavigationEntry(),
+        guard !isUpdating,
+              let navigationEntry = store.latestNavigationEntry(),
               let record = store.record(for: navigationEntry.date),
               let imageURL = store.cachedImageURL(for: record.apod.date),
               record.apod.mediaType == .image || record.cachedImageSourceURL != nil else {
             return
         }
-
-        navigationCursorID = navigationEntry.id
-        latestAPOD = record.apod
+        isUpdating = true
+        lastError = nil
+        operationMessage = "Applying cached wallpaper…"
+        onChange?()
         do {
             try wallpaper.apply(imageURL: imageURL, presentation: wallpaperPresentation)
+            navigationCursorID = navigationEntry.id
+            latestAPOD = record.apod
             currentImageURL = imageURL
             emptyStateMessage = nil
+            operationMessage = "Wallpaper restored"
         } catch {
             lastError = error
+            operationMessage = error.localizedDescription
         }
+        isUpdating = false
+        onChange?()
     }
 
     public func refresh(force: Bool = false) async {
-        guard !isUpdating else {
-            return
-        }
-
-        isUpdating = true
-        lastError = nil
-        emptyStateMessage = nil
-        defer { isUpdating = false }
-
-        do {
-            switch wallpaperSource {
-            case .today:
-                try await refreshToday(force: force)
-            case .archive:
-                try await refreshArchive()
-            case .favorites:
-                try await refreshFavorites()
-            }
-            lastSuccessfulCheckAt = Date()
-        } catch {
-            lastError = error
-            if currentImageURL == nil {
-                restoreCachedWallpaper()
-            }
+        await runOperation(message: "Fetching APOD…") {
+            try await self.refreshSelectedSource(force: force)
         }
     }
 
     public func nextWallpaper() async {
-        guard !isUpdating else {
-            return
+        await runOperation(message: "Preparing next wallpaper…") {
+            if let cursor = self.navigationCursorID,
+               let entry = self.store.navigationEntry(after: cursor) {
+                try await self.displayNavigationEntry(entry)
+            } else {
+                self.setOperationMessage("Fetching APOD…")
+                try await self.refreshSelectedSource(force: true)
+            }
         }
-        if let navigationCursorID,
-           let entry = store.navigationEntry(after: navigationCursorID) {
-            await displayNavigationEntry(entry)
-            return
-        }
-        await refresh(force: true)
     }
 
     public func previousWallpaper() async {
-        guard let navigationCursorID,
-              let entry = store.navigationEntry(before: navigationCursorID) else {
-            return
+        guard let cursor = navigationCursorID,
+              let entry = store.navigationEntry(before: cursor) else { return }
+        await runOperation(message: "Preparing previous wallpaper…") {
+            try await self.displayNavigationEntry(entry)
         }
-        await displayNavigationEntry(entry)
     }
 
     public func showAgain(date: String) async {
-        guard let record = store.record(for: date) else {
-            return
-        }
-        do {
-            _ = try await displayHistorical(record, recordHistory: true)
-        } catch {
-            lastError = error
+        guard let record = store.record(for: date) else { return }
+        await runOperation(message: "Preparing wallpaper…") {
+            _ = try await self.displayHistorical(record, recordHistory: true)
         }
     }
 
     public func setFavorite(for date: String, isFavorite: Bool) {
         do {
             try store.markFavorite(date: date, isFavorite: isFavorite)
+            lastError = nil
         } catch {
             lastError = error
         }
+        onChange?()
     }
 
     @discardableResult
@@ -217,12 +235,23 @@ public final class WallpaperCoordinator {
         return newValue
     }
 
-    public func clearImageCache() {
+    @discardableResult
+    public func clearImageCache() -> Result<Int64, Error> {
+        guard !isUpdating else {
+            return .failure(WallpaperCoordinatorError.updateInProgress)
+        }
         do {
             try store.clearImageCache()
             currentImageURL = nil
+            lastError = nil
+            operationMessage = "Image cache cleared"
+            onChange?()
+            return .success(store.cacheSizeBytes())
         } catch {
             lastError = error
+            operationMessage = error.localizedDescription
+            onChange?()
+            return .failure(error)
         }
     }
 
@@ -230,14 +259,84 @@ public final class WallpaperCoordinator {
         store.cacheSizeBytes()
     }
 
+    private func runOperation(
+        message: String,
+        operation: @escaping @MainActor () async throws -> Void
+    ) async {
+        guard !isUpdating, !Task.isCancelled else { return }
+        isUpdating = true
+        lastError = nil
+        let previousEmptyState = emptyStateMessage
+        emptyStateMessage = nil
+        downloadFraction = nil
+        operationMessage = message
+        let task = Task { @MainActor in
+            do {
+                try Task.checkCancellation()
+                try await operation()
+                try Task.checkCancellation()
+                self.operationMessage = self.emptyStateMessage ?? "Wallpaper updated"
+            } catch {
+                if Task.isCancelled || error is CancellationError
+                    || (error as? URLError)?.code == .cancelled {
+                    self.lastError = nil
+                    self.emptyStateMessage = previousEmptyState
+                    self.operationMessage = "Update cancelled"
+                } else {
+                    self.lastError = error
+                    self.operationMessage = error.localizedDescription
+                }
+            }
+            self.activeDownloadID = nil
+            self.downloadFraction = nil
+            self.isUpdating = false
+            self.operationTask = nil
+            self.onChange?()
+        }
+        operationTask = task
+        onChange?()
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func setOperationMessage(_ message: String) {
+        operationMessage = message
+        downloadFraction = nil
+        onChange?()
+    }
+
+    private func refreshSelectedSource(force: Bool) async throws {
+        switch wallpaperSource {
+        case .today:
+            try await refreshToday(force: force)
+        case .archive:
+            try await refreshArchive()
+        case .favorites:
+            try await refreshFavorites()
+        }
+        try Task.checkCancellation()
+        lastSuccessfulCheckAt = Date()
+    }
+
     private func refreshToday(force: Bool) async throws {
         let apod = try await client.fetchLatest()
-        try store.save(apod)
+        try Task.checkCancellation()
 
         if !force,
            apod.date == latestAPOD?.date,
-           (currentImageURL != nil || effectiveNonImageBehavior(for: .today) == .keepCurrent) {
+           ((currentImageURL != nil
+             && store.record(for: apod.date)?.cachedImageSourceURL == imageSourceURL(for: apod))
+            || (apod.mediaType != .image
+                && effectiveNonImageBehavior(for: .today) == .keepCurrent)) {
+            try store.save(apod)
             latestAPOD = apod
+            if apod.mediaType != .image,
+               effectiveNonImageBehavior(for: .today) == .keepCurrent {
+                emptyStateMessage = "Today's APOD is not an image. Keeping the current wallpaper."
+            }
             return
         }
         _ = try await display(apod, recordHistory: true)
@@ -245,6 +344,7 @@ public final class WallpaperCoordinator {
 
     private func refreshArchive() async throws {
         var candidates = try await client.fetchRandom(count: 20)
+        try Task.checkCancellation()
         if let latestAPOD,
            !candidates.contains(where: { $0.date == latestAPOD.date }) {
             candidates.append(latestAPOD)
@@ -270,6 +370,7 @@ public final class WallpaperCoordinator {
                     return
                 }
             } catch {
+                try Task.checkCancellation()
                 lastFailure = error
             }
         }
@@ -301,6 +402,7 @@ public final class WallpaperCoordinator {
                     return
                 }
             } catch {
+                try Task.checkCancellation()
                 lastFailure = error
             }
         }
@@ -309,38 +411,23 @@ public final class WallpaperCoordinator {
 
     @discardableResult
     private func display(_ apod: APOD, recordHistory: Bool) async throws -> Bool {
-        latestAPOD = apod
-        try store.save(apod)
-
+        try Task.checkCancellation()
         guard let sourceURL = imageSourceURL(for: apod) else {
             switch effectiveNonImageBehavior(for: wallpaperSource) {
             case .keepCurrent:
+                try store.save(apod)
+                latestAPOD = apod
                 emptyStateMessage = "Today's APOD is not an image. Keeping the current wallpaper."
                 return false
             case .skip:
+                try store.save(apod)
+                emptyStateMessage = "This APOD is not an image. Keeping the current wallpaper."
                 return false
             case .useThumbnail, .automatic:
                 throw WallpaperCoordinatorError.missingImageURL
             }
         }
-
-        let cachedRecord = store.record(for: apod.date)
-        let imageURL: URL
-        if cachedRecord?.cachedImageSourceURL == sourceURL,
-           let cachedImageURL = store.cachedImageURL(for: apod.date) {
-            imageURL = cachedImageURL
-        } else {
-            let data = try await imageDownloader.download(from: sourceURL)
-            imageURL = try store.saveImageData(data, for: apod.date)
-            try store.save(apod, imageSourceURL: sourceURL)
-        }
-
-        try wallpaper.apply(imageURL: imageURL, presentation: wallpaperPresentation)
-        currentImageURL = imageURL
-        emptyStateMessage = nil
-        if recordHistory {
-            navigationCursorID = try store.recordShown(apod).id
-        }
+        try await applyImage(for: apod, sourceURL: sourceURL, recordHistory: recordHistory)
         return true
     }
 
@@ -349,46 +436,89 @@ public final class WallpaperCoordinator {
         _ record: APODRecord,
         recordHistory: Bool
     ) async throws -> Bool {
-        latestAPOD = record.apod
-        let sourceURL: URL?
-        if record.apod.mediaType == .image {
-            sourceURL = preferredImageURL(for: record.apod)
-        } else {
-            sourceURL = record.cachedImageSourceURL
-        }
+        let sourceURL = record.apod.mediaType == .image
+            ? preferredImageURL(for: record.apod)
+            : record.cachedImageSourceURL
         guard let sourceURL else {
             throw WallpaperCoordinatorError.missingImageURL
         }
-
-        let imageURL: URL
-        if record.cachedImageSourceURL == sourceURL,
-           let cachedImageURL = store.cachedImageURL(for: record.apod.date) {
-            imageURL = cachedImageURL
-        } else {
-            let data = try await imageDownloader.download(from: sourceURL)
-            imageURL = try store.saveImageData(data, for: record.apod.date)
-            try store.save(record.apod, imageSourceURL: sourceURL)
-        }
-
-        try wallpaper.apply(imageURL: imageURL, presentation: wallpaperPresentation)
-        currentImageURL = imageURL
-        emptyStateMessage = nil
-        if recordHistory {
-            navigationCursorID = try store.recordShown(record.apod).id
-        }
+        try await applyImage(for: record.apod, sourceURL: sourceURL, recordHistory: recordHistory)
         return true
     }
 
-    private func displayNavigationEntry(_ entry: NavigationEntry) async {
-        guard let record = store.record(for: entry.date) else {
-            return
+    private func applyImage(for apod: APOD, sourceURL: URL, recordHistory: Bool) async throws {
+        try Task.checkCancellation()
+        let record = store.record(for: apod.date)
+        let imageURL: URL
+        let isStaged: Bool
+        if record?.cachedImageSourceURL == sourceURL,
+           let cachedImageURL = store.cachedImageURL(for: apod.date) {
+            imageURL = cachedImageURL
+            isStaged = false
+        } else {
+            let data = try await downloadImage(from: sourceURL)
+            try Task.checkCancellation()
+            imageURL = try store.stageImageData(data, for: apod.date)
+            isStaged = true
         }
         do {
-            _ = try await displayHistorical(record, recordHistory: false)
-            navigationCursorID = entry.id
+            try Task.checkCancellation()
+            setOperationMessage("Applying wallpaper…")
+            try Task.checkCancellation()
+            try wallpaper.apply(imageURL: imageURL, presentation: wallpaperPresentation)
         } catch {
-            lastError = error
+            if isStaged { store.discardStagedImage(at: imageURL) }
+            throw error
         }
+        // Applying is synchronous on MainActor. Nothing can interleave between the
+        // successful system call and committing the current selection.
+        latestAPOD = apod
+        currentImageURL = imageURL
+        emptyStateMessage = nil
+        if isStaged {
+            try store.commitImage(at: imageURL, for: apod, sourceURL: sourceURL)
+        } else {
+            try store.save(apod)
+        }
+        if recordHistory {
+            navigationCursorID = try store.recordShown(apod).id
+        } else {
+            try store.recordReapplied(apod)
+        }
+    }
+
+    private func downloadImage(from url: URL) async throws -> Data {
+        let downloadID = UUID()
+        activeDownloadID = downloadID
+        setOperationMessage("Downloading image…")
+        defer {
+            activeDownloadID = nil
+            downloadFraction = nil
+        }
+        return try await imageDownloader.download(from: url) { [weak self] received, expected in
+            Task { @MainActor [weak self] in
+                guard let self, self.activeDownloadID == downloadID,
+                      self.isUpdating, self.operationTask?.isCancelled == false else { return }
+                let receivedText = ByteCountFormatter.string(fromByteCount: received, countStyle: .file)
+                if expected > 0 {
+                    self.downloadFraction = min(1, max(0, Double(received) / Double(expected)))
+                    let expectedText = ByteCountFormatter.string(fromByteCount: expected, countStyle: .file)
+                    self.operationMessage = "Downloading image — \(receivedText) of \(expectedText)"
+                } else {
+                    self.downloadFraction = nil
+                    self.operationMessage = "Downloading image — \(receivedText)"
+                }
+                self.onChange?()
+            }
+        }
+    }
+
+    private func displayNavigationEntry(_ entry: NavigationEntry) async throws {
+        guard let record = store.record(for: entry.date) else {
+            throw WallpaperCoordinatorError.noArchiveCandidate
+        }
+        _ = try await displayHistorical(record, recordHistory: false)
+        navigationCursorID = entry.id
     }
 
     private func canAttempt(_ apod: APOD, for source: WallpaperSource) -> Bool {

@@ -28,13 +28,13 @@ jobs:
 
       - name: Build application bundle
         env:
-          VERSION: 1.0
+          VERSION: "2.0"
           BUILD_NUMBER: ${{ github.run_number }}
         run: ./Scripts/build-app.sh
 
       - name: Upload application bundle
         uses: actions/upload-artifact@v4
         with:
-          name: APOD-Wallpaper-${{ github.sha }}
-          path: "build/APOD Wallpaper.app"
+          name: Daystar-${{ github.sha }}
+          path: "build/Daystar.app"
           if-no-files-found: error

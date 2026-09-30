@@ -8,6 +8,8 @@ struct APODWallpaperMain {
         application.setActivationPolicy(.accessory)
         let delegate = AppDelegate()
         application.delegate = delegate
-        application.run()
+        withExtendedLifetime(delegate) {
+            application.run()
+        }
     }
 }

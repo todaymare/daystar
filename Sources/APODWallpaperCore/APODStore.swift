@@ -255,7 +255,7 @@ public final class APODStore: @unchecked Sendable {
     }
 
     public func cachedImageURL(for date: String) -> URL? {
-        let url = imageURL(for: date)
+        let url = record(for: date)?.cachedImagePath ?? imageURL(for: date)
         guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
               let size = attributes[.size] as? NSNumber,
               size.intValue > 0 else {
@@ -270,6 +270,14 @@ public final class APODStore: @unchecked Sendable {
 
     @discardableResult
     public func saveImageData(_ data: Data, for date: String) throws -> URL {
+        try saveImageData(data, for: date, staging: false)
+    }
+
+    func stageImageData(_ data: Data, for date: String) throws -> URL {
+        try saveImageData(data, for: date, staging: true)
+    }
+
+    private func saveImageData(_ data: Data, for date: String, staging: Bool) throws -> URL {
         guard !data.isEmpty else {
             throw APODStoreError.emptyImageData
         }
@@ -279,8 +287,11 @@ public final class APODStore: @unchecked Sendable {
             throw APODStoreError.invalidImageData
         }
 
-        let url = imageURL(for: date)
+        let url = staging
+            ? imageDirectoryURL.appendingPathComponent("\(date)-\(UUID().uuidString).image")
+            : imageURL(for: date)
         try data.write(to: url, options: .atomic)
+        if staging { return url }
         try withDatabase { database in
             let statement = try Self.prepare(
                 database,
@@ -296,6 +307,41 @@ public final class APODStore: @unchecked Sendable {
         return url
     }
 
+    func commitImage(at url: URL, for apod: APOD, sourceURL: URL) throws {
+        let previousURL = cachedImageURL(for: apod.date)
+        try save(apod, imageSourceURL: sourceURL)
+        try withDatabase { database in
+            let statement = try Self.prepare(
+                database,
+                sql: "UPDATE apods SET cached_image_path = ? WHERE date = ?"
+            )
+            defer { sqlite3_finalize(statement) }
+            try Self.bind(url.path, at: 1, in: statement)
+            try Self.bind(apod.date, at: 2, in: statement)
+            try Self.step(statement, in: database)
+        }
+        if let previousURL, previousURL != url {
+            try? fileManager.removeItem(at: previousURL)
+        }
+    }
+
+    func discardStagedImage(at url: URL) {
+        try? fileManager.removeItem(at: url)
+    }
+
+    func recordReapplied(_ apod: APOD, at date: Date = Date()) throws {
+        try withDatabase { database in
+            let statement = try Self.prepare(database, sql: """
+                UPDATE apods SET last_shown_at = ?, show_count = show_count + 1
+                WHERE date = ?
+                """)
+            defer { sqlite3_finalize(statement) }
+            try Self.bind(date.timeIntervalSince1970, at: 1, in: statement)
+            try Self.bind(apod.date, at: 2, in: statement)
+            try Self.step(statement, in: database)
+        }
+    }
+
     public func clearImageCache() throws {
         for url in try fileManager.contentsOfDirectory(
             at: imageDirectoryURL,
@@ -306,7 +352,7 @@ public final class APODStore: @unchecked Sendable {
         try withDatabase { database in
             try Self.execute(
                 database,
-                sql: "UPDATE apods SET cached_image_path = NULL, cached_source_url = NULL"
+                sql: "UPDATE apods SET cached_image_path = NULL"
             )
         }
     }
@@ -549,24 +595,124 @@ public enum APODStoreError: Error, Equatable, LocalizedError, Sendable {
 }
 
 public protocol ImageDownloading: Sendable {
-    func download(from url: URL) async throws -> Data
+    func download(
+        from url: URL,
+        progress: @escaping @Sendable (_ receivedBytes: Int64, _ expectedBytes: Int64) -> Void
+    ) async throws -> Data
 }
 
 public struct URLSessionImageDownloader: ImageDownloading, @unchecked Sendable {
-    private let session: URLSession
+    private let configuration: URLSessionConfiguration
 
     public init(session: URLSession = .shared) {
-        self.session = session
+        self.configuration = session.configuration
     }
 
-    public func download(from url: URL) async throws -> Data {
-        let (data, response) = try await session.data(from: url)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw APODClientError.invalidResponse
+    public func download(
+        from url: URL,
+        progress: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws -> Data {
+        let transfer = ImageDownloadTransfer(progress: progress)
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                transfer.start(url: url, configuration: configuration, continuation: continuation)
+            }
+        } onCancel: {
+            transfer.cancel()
         }
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            throw APODClientError.httpStatus(httpResponse.statusCode)
+    }
+}
+
+private final class ImageDownloadTransfer: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private let progress: @Sendable (Int64, Int64) -> Void
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var task: URLSessionDownloadTask?
+    private var cancelled = false
+    private var result: Result<Data, Error>?
+    private var lastProgressAt = Date.distantPast
+
+    init(progress: @escaping @Sendable (Int64, Int64) -> Void) {
+        self.progress = progress
+    }
+
+    func start(
+        url: URL,
+        configuration: URLSessionConfiguration,
+        continuation: CheckedContinuation<Data, Error>
+    ) {
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        let task = session.downloadTask(with: url)
+        lock.lock()
+        self.continuation = continuation
+        self.task = task
+        let shouldCancel = cancelled
+        lock.unlock()
+        task.resume()
+        if shouldCancel {
+            task.cancel()
         }
-        return data
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let task = task
+        lock.unlock()
+        task?.cancel()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        let now = Date()
+        guard now.timeIntervalSince(lastProgressAt) >= 0.1
+            || totalBytesWritten == totalBytesExpectedToWrite else { return }
+        lastProgressAt = now
+        progress(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        result = Result {
+            guard let response = downloadTask.response as? HTTPURLResponse else {
+                throw APODClientError.invalidResponse
+            }
+            guard (200..<300).contains(response.statusCode) else {
+                throw APODClientError.httpStatus(response.statusCode)
+            }
+            // The temporary file disappears after this delegate callback. Mapping avoids
+            // accumulating chunks or copying the complete response into another buffer.
+            return try Data(contentsOf: location, options: .mappedIfSafe)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        self.task = nil
+        let wasCancelled = cancelled
+        lock.unlock()
+        session.finishTasksAndInvalidate()
+        if wasCancelled {
+            continuation?.resume(throwing: CancellationError())
+        } else if let error {
+            continuation?.resume(throwing: error)
+        } else {
+            continuation?.resume(with: result ?? .failure(APODClientError.invalidResponse))
+        }
     }
 }

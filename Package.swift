@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "APODWallpaper",
+    name: "Daystar",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "APODWallpaper", targets: ["APODWallpaperApp"])
+        .executable(name: "Daystar", targets: ["APODWallpaperApp"])
     ],
     targets: [
         .target(

@@ -25,7 +25,6 @@ final class WallpaperCoordinatorTests: XCTestCase {
         await coordinator.refresh()
 
         XCTAssertEqual(downloader.requestedURLs, [apod.hdURL!])
-        XCTAssertEqual(wallpaper.appliedURLs, [store.imageURL(for: apod.date)])
         XCTAssertEqual(store.record(for: apod.date)?.showCount, 1)
         XCTAssertEqual(store.seenDates(), [apod.date])
     }
@@ -93,7 +92,6 @@ final class WallpaperCoordinatorTests: XCTestCase {
         await coordinator.refresh()
 
         XCTAssertEqual(coordinator.latestAPOD?.date, unseen.date)
-        XCTAssertEqual(wallpaper.appliedURLs, [store.imageURL(for: unseen.date)])
         XCTAssertEqual(store.seenDates(), Set([seen.date, unseen.date]))
     }
 
@@ -116,7 +114,6 @@ final class WallpaperCoordinatorTests: XCTestCase {
         await coordinator.refresh()
 
         XCTAssertEqual(downloader.requestedURLs, [favorite.url])
-        XCTAssertEqual(wallpaper.appliedURLs, [store.imageURL(for: favorite.date)])
     }
 
     func testTodayVideoKeepsCurrentWallpaperByDefault() async throws {
@@ -175,10 +172,10 @@ final class WallpaperCoordinatorTests: XCTestCase {
         let store = try APODStore(directoryURL: directory)
         try store.save(first, imageSourceURL: first.url)
         _ = try store.saveImageData(validImageData, for: first.date)
-        _ = try store.recordShown(first)
+        _ = try store.recordShown(first, at: Date(timeIntervalSince1970: 1))
         try store.save(second, imageSourceURL: second.url)
         _ = try store.saveImageData(validImageData, for: second.date)
-        _ = try store.recordShown(second)
+        let lastEntry = try store.recordShown(second, at: Date(timeIntervalSince1970: 2))
 
         let wallpaper = RecordingWallpaper()
         let coordinator = WallpaperCoordinator(
@@ -190,9 +187,13 @@ final class WallpaperCoordinatorTests: XCTestCase {
 
         await coordinator.previousWallpaper()
         XCTAssertEqual(coordinator.latestAPOD?.date, first.date)
+        XCTAssertEqual(store.recentRecords().first?.apod.date, first.date)
+        XCTAssertFalse(coordinator.canGoPrevious)
         await coordinator.nextWallpaper()
         XCTAssertEqual(coordinator.latestAPOD?.date, second.date)
-        XCTAssertEqual(store.recentRecords().first?.showCount, 1)
+        XCTAssertEqual(store.recentRecords().first?.apod.date, second.date)
+        XCTAssertEqual(store.latestNavigationEntry(), lastEntry)
+        XCTAssertTrue(coordinator.canGoPrevious)
     }
 
     func testInvalidImageDataNeverEntersCache() throws {
@@ -222,6 +223,199 @@ final class WallpaperCoordinatorTests: XCTestCase {
         store.save(settings)
 
         XCTAssertEqual(store.load(), settings)
+    }
+
+    func testFailedApplyPreservesCurrentSelectionAndHistory() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = makeAPOD(date: "2026-05-20", mediaType: .image)
+        let second = makeAPOD(date: "2026-05-21", mediaType: .image)
+        let store = try APODStore(directoryURL: directory)
+        try store.save(first, imageSourceURL: first.url)
+        let firstImage = try store.saveImageData(validImageData, for: first.date)
+        let firstEntry = try store.recordShown(first, at: Date(timeIntervalSince1970: 1))
+        try store.save(second)
+        let wallpaper = RecordingWallpaper()
+        wallpaper.failure = URLError(.cannotOpenFile)
+        let coordinator = WallpaperCoordinator(
+            client: StubClient(latest: second, random: []),
+            store: store,
+            wallpaper: wallpaper,
+            imageDownloader: RecordingDownloader(data: validImageData)
+        )
+
+        await coordinator.showAgain(date: second.date)
+
+        XCTAssertEqual(coordinator.latestAPOD, first)
+        XCTAssertEqual(coordinator.currentImageURL, firstImage)
+        XCTAssertEqual(store.latestNavigationEntry(), firstEntry)
+        XCTAssertEqual(store.recentRecords().map(\.apod.date), [first.date])
+        XCTAssertNil(store.cachedImageURL(for: second.date))
+        XCTAssertNotNil(coordinator.lastError)
+        XCTAssertFalse(coordinator.isUpdating)
+
+        wallpaper.failure = nil
+        await coordinator.showAgain(date: second.date)
+        XCTAssertEqual(coordinator.latestAPOD, second)
+        XCTAssertNil(coordinator.lastError)
+        XCTAssertEqual(store.recentRecords().map(\.apod.date), [second.date, first.date])
+    }
+
+    func testFailedResolutionChangePreservesCachedCurrentImage() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let apod = makeAPOD(
+            date: "2026-05-20",
+            mediaType: .image,
+            hdURL: URL(string: "https://example.com/hd.jpg")
+        )
+        let store = try APODStore(directoryURL: directory)
+        try store.save(apod, imageSourceURL: apod.url)
+        let originalImage = try store.saveImageData(validImageData, for: apod.date)
+        _ = try store.recordShown(apod)
+        let wallpaper = RecordingWallpaper()
+        wallpaper.failure = URLError(.cannotOpenFile)
+        let coordinator = WallpaperCoordinator(
+            client: StubClient(latest: apod, random: []),
+            store: store,
+            wallpaper: wallpaper,
+            imageDownloader: RecordingDownloader(data: validImageData)
+        )
+
+        await coordinator.reapplyCurrent()
+
+        XCTAssertEqual(coordinator.currentImageURL, originalImage)
+        XCTAssertEqual(store.cachedImageURL(for: apod.date), originalImage)
+        XCTAssertEqual(store.record(for: apod.date)?.cachedImageSourceURL, apod.url)
+        XCTAssertEqual(try Data(contentsOf: originalImage), validImageData)
+    }
+
+    func testSingleFlightProgressAndCancellationPreserveCurrentWallpaper() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = makeAPOD(date: "2026-05-20", mediaType: .image)
+        let second = makeAPOD(date: "2026-05-21", mediaType: .image)
+        let store = try APODStore(directoryURL: directory)
+        let older = makeAPOD(date: "2026-05-19", mediaType: .image)
+        try store.save(older, imageSourceURL: older.url)
+        _ = try store.saveImageData(validImageData, for: older.date)
+        _ = try store.recordShown(older, at: Date(timeIntervalSince1970: 1))
+        try store.save(first, imageSourceURL: first.url)
+        let originalImage = try store.saveImageData(validImageData, for: first.date)
+        let originalEntry = try store.recordShown(first, at: Date(timeIntervalSince1970: 2))
+        try store.save(second)
+        let downloader = ControlledDownloader()
+        let wallpaper = RecordingWallpaper()
+        let coordinator = WallpaperCoordinator(
+            client: StubClient(latest: second, random: []),
+            store: store,
+            wallpaper: wallpaper,
+            imageDownloader: downloader
+        )
+        let (progressStream, progressContinuation) = AsyncStream<Double>.makeStream()
+        var sawBusy = false
+        var sawCancelledIdle = false
+        coordinator.onChange = {
+            sawBusy = sawBusy || coordinator.isUpdating
+            if let fraction = coordinator.downloadFraction {
+                progressContinuation.yield(fraction)
+            }
+            if !coordinator.isUpdating, coordinator.lastError == nil {
+                sawCancelledIdle = true
+            }
+        }
+        let update = Task { await coordinator.showAgain(date: second.date) }
+        await downloader.waitForDownload()
+        XCTAssertTrue(coordinator.isUpdating)
+
+        await coordinator.refresh(force: true)
+        await coordinator.reapplyCurrent()
+        await coordinator.previousWallpaper()
+        await coordinator.nextWallpaper()
+        await coordinator.showAgain(date: first.date)
+        let requestCount = await downloader.requestCount
+        XCTAssertEqual(requestCount, 1)
+        if case .success = coordinator.clearImageCache() {
+            XCTFail("Cache clearing must reject an in-flight wallpaper operation")
+        }
+        XCTAssertEqual(store.cachedImageURL(for: first.date), originalImage)
+
+        await downloader.emitProgress(received: 25, expected: 100)
+        var iterator = progressStream.makeAsyncIterator()
+        let fraction = await iterator.next()
+        XCTAssertEqual(fraction, 0.25)
+        XCTAssertEqual(coordinator.latestAPOD, first)
+        coordinator.cancelUpdate()
+        await update.value
+        progressContinuation.finish()
+
+        XCTAssertTrue(sawBusy)
+        XCTAssertTrue(sawCancelledIdle)
+        XCTAssertFalse(coordinator.isUpdating)
+        XCTAssertNil(coordinator.lastError)
+        XCTAssertNil(coordinator.downloadFraction)
+        XCTAssertEqual(coordinator.latestAPOD, first)
+        XCTAssertEqual(coordinator.currentImageURL, originalImage)
+        XCTAssertEqual(store.latestNavigationEntry(), originalEntry)
+        XCTAssertTrue(wallpaper.appliedURLs.isEmpty)
+    }
+
+    func testHistoricalVideoThumbnailReappliesOfflineAfterBehaviorChange() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let thumbnailURL = URL(string: "https://example.com/thumb.jpg")!
+        let video = makeAPOD(date: "2026-05-20", mediaType: .video, thumbnailURL: thumbnailURL)
+        let store = try APODStore(directoryURL: directory)
+        try store.save(video, imageSourceURL: thumbnailURL)
+        let cachedImage = try store.saveImageData(validImageData, for: video.date)
+        _ = try store.recordShown(video)
+        let downloader = RecordingDownloader(data: validImageData)
+        let wallpaper = RecordingWallpaper()
+        let coordinator = WallpaperCoordinator(
+            client: StubClient(latest: video, random: []),
+            store: store,
+            wallpaper: wallpaper,
+            imageDownloader: downloader,
+            settings: APODSettings(nonImageBehavior: .keepCurrent)
+        )
+
+        await coordinator.reapplyCurrent()
+
+        XCTAssertEqual(wallpaper.appliedURLs, [cachedImage])
+        XCTAssertTrue(downloader.requestedURLs.isEmpty)
+        XCTAssertNil(coordinator.lastError)
+
+        _ = try coordinator.clearImageCache().get()
+        await coordinator.showAgain(date: video.date)
+        XCTAssertEqual(downloader.requestedURLs, [thumbnailURL])
+        XCTAssertEqual(coordinator.latestAPOD, video)
+        XCTAssertEqual(store.record(for: video.date)?.cachedImageSourceURL, thumbnailURL)
+        XCTAssertNil(coordinator.lastError)
+    }
+
+    func testCallerCancellationStopsDownloadWithoutNetworkError() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let apod = makeAPOD(date: "2026-05-20", mediaType: .image)
+        let downloader = ControlledDownloader()
+        let coordinator = WallpaperCoordinator(
+            client: StubClient(latest: apod, random: []),
+            store: try APODStore(directoryURL: directory),
+            wallpaper: RecordingWallpaper(),
+            imageDownloader: downloader,
+            settings: APODSettings(wallpaperSource: .today)
+        )
+        let update = Task { await coordinator.refresh() }
+        await downloader.waitForDownload()
+
+        update.cancel()
+        await update.value
+
+        XCTAssertFalse(coordinator.isUpdating)
+        XCTAssertNil(coordinator.lastError)
+        XCTAssertNil(coordinator.latestAPOD)
+        XCTAssertNil(coordinator.currentImageURL)
+        XCTAssertTrue(coordinator.recentRecords().isEmpty)
     }
 
     private func makeAPOD(
@@ -278,7 +472,10 @@ private final class RecordingDownloader: ImageDownloading, @unchecked Sendable {
         self.data = data
     }
 
-    func download(from url: URL) async throws -> Data {
+    func download(
+        from url: URL,
+        progress: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws -> Data {
         requestedURLs.append(url)
         return data
     }
@@ -287,8 +484,55 @@ private final class RecordingDownloader: ImageDownloading, @unchecked Sendable {
 @MainActor
 private final class RecordingWallpaper: WallpaperApplying {
     private(set) var appliedURLs: [URL] = []
+    var failure: Error?
 
     func apply(imageURL: URL, presentation: WallpaperPresentation) throws {
+        if let failure { throw failure }
         appliedURLs.append(imageURL)
+    }
+}
+
+private actor ControlledDownloader: ImageDownloading {
+    private(set) var requestCount = 0
+    private var pending: CheckedContinuation<Data, Error>?
+    private var started: CheckedContinuation<Void, Never>?
+    private var progress: (@Sendable (Int64, Int64) -> Void)?
+    private var isCancelled = false
+
+    func download(
+        from url: URL,
+        progress: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws -> Data {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                if isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                requestCount += 1
+                self.progress = progress
+                pending = continuation
+                started?.resume()
+                started = nil
+            }
+        } onCancel: {
+            Task { await self.cancelDownload() }
+        }
+    }
+
+    func waitForDownload() async {
+        if requestCount > 0 { return }
+        await withCheckedContinuation { started = $0 }
+    }
+
+    func emitProgress(received: Int64, expected: Int64) {
+        progress?(received, expected)
+    }
+
+    private func cancelDownload() {
+        isCancelled = true
+        pending?.resume(throwing: CancellationError())
+        pending = nil
     }
 }
